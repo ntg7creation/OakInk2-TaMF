@@ -1,2 +1,4 @@
 # Keep the portable Slurm wrappers executable by Bash in WSL/Linux checkouts.
 script/slurm/*.sbatch text eol=lf
+/train.sbatch text eol=lf
+/submit_train_chain.sh text eol=lf
