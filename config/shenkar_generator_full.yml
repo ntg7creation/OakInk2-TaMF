@@ -1,0 +1,31 @@
+data:
+  append_reverse_segment: true
+  obj_embedding_prefix: common/retrieve_obj_embedding/main/embedding
+  obj_pointcloud_prefix: common/retrieve_obj_pointcloud/main/pointcloud
+  enable_obj_model: true
+train:
+  cache_dict_filepath: common/save_cache_dict/main/cache/train.pkl
+  loss:
+    vpe_path: asset/grabnet/verts_per_edge.npy
+    c_weight_path: asset/grabnet/rhand_weight.npy
+    coef_rec_joint_loss: 1.0
+    coef_rec_vert_loss: 1.0
+    coef_edge_len_loss: 0.1
+    coef_dist_h_loss: 0.1
+    coef_dist_o_loss: 1.0
+  batch_size: 4
+val:
+  cache_dict_filepath: common/save_cache_dict/main/cache/val.pkl
+test:
+  cache_dict_filepath: common/save_cache_dict/main/cache/test.pkl
+model:
+  input_dim: 99
+  obj_input_dim: 9
+  hand_shape_dim: 10
+  obj_embed_dim: 768
+  latent_dim: 512
+  ff_size: 2048
+  num_layers: 8
+  num_heads: 4
+  dropout: 0.1
+  activation: gelu
