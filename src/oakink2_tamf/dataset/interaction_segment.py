@@ -301,7 +301,10 @@ class InteractionSegmentData(torch.utils.data.Dataset):
         self.data_prefix = data_prefix
 
         # dataset
-        self.dataset = OakInk2__Dataset(dataset_prefix=self.data_prefix, return_instantiated=True)
+        # A cache with precomputed point clouds/embeddings needs no raw toolkit
+        # metadata. Mesh loading still uses the original toolkit path.
+        self.dataset = (OakInk2__Dataset(dataset_prefix=self.data_prefix, return_instantiated=True)
+                        if cache_dict is None or enable_obj_model else None)
 
         # deal with slicing
         self.origin_fps = FPS_MOCAP

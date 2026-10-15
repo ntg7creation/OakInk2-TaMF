@@ -21,6 +21,7 @@ from oakink2_tamf.launch.param import reg_base_param
 from dev_fn.util.console_io import suppress_trimesh_logging
 
 from oakink2_tamf.dataset.interaction_segment import InteractionSegmentData
+from oakink2_tamf.dataset.cache_util import build_cache, read_cache
 import random
 from dev_fn.util import random_util
 
@@ -49,11 +50,18 @@ def reg_entry(config_reg: ConfigRegistry):
         source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG,
         required=True,
     )
+    config_reg.register("output_filepath", prefix="cache", category=str,
+                        source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG,
+                        callback=abspath_callback, default=None)
+    for name in ("resume", "verify_only"):
+        config_reg.register(name, prefix="cache", category=bool,
+                            source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG,
+                            cmdpattern=ConfigEntryCommandlineBoolPattern.SET_TRUE, default=False)
 
 
 def reg_extract(config_reg: ConfigRegistry):
     res = {}
-    for _p in [PARAM_PREFIX__DATA, PARAM_PREFIX__INFER, PARAM_PREFIX__RUNTIME]:
+    for _p in [PARAM_PREFIX__DATA, PARAM_PREFIX__INFER, PARAM_PREFIX__RUNTIME, "cache"]:
         try:
             res[_p] = config_reg.select(_p)
         except KeyError:
@@ -73,9 +81,6 @@ def main():
     ckpt_cfg = ckpt.reg_extract(config_reg)
     run_cfg = reg_extract(config_reg)
 
-    ckpt.ckpt_setup(ckpt_cfg)
-    ckpt.ckpt_opt(ckpt_cfg, ckpt=ckpt_cfg, run=run_cfg)
-
     log.log_init()
     log.enable_console()
     _logger.info("ckpt_cfg: %s", argdict_to_string(ckpt_cfg))
@@ -87,21 +92,28 @@ def main():
     commit = ckpt_cfg["commit"]
     ckpt_path = ckpt_cfg["ckpt_path"]
 
-    # dataset
     process_range_list = run_cfg["data"]["process_range"]
-    all_dataset = InteractionSegmentData(
-        process_range_list=process_range_list,
-        data_prefix=run_cfg["data"]["data_prefix"],
-        enable_obj_model=True,
-    )
-    all_dataset_cache_dict = all_dataset.get_cache()
+    split = run_cfg["data"]["split_name"]
+    cache_path = run_cfg["cache"]["output_filepath"] or os.path.join(ckpt_path, "cache", f"{split}.pkl")
+    if run_cfg["cache"]["verify_only"]:
+        cache, manifest = read_cache(cache_path, process_range_list, split_name=split)
+        _logger.info("Cache validated: %s | %d segments | provenance=%s", cache_path,
+                     len(cache["interaction_segment_info_list"]), "verified" if manifest else "legacy/unknown")
+        return
+    if not commit:
+        raise ValueError("cache generation requires --commit; use --cache.verify_only for inspection")
 
-    if commit:
-        cache_key = run_cfg["data"]["split_name"]
-        cache_path = os.path.join(ckpt_path, "cache", f"{cache_key}.pkl")
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, "wb") as ofstream:
-            pickle.dump(all_dataset_cache_dict, ofstream)
+    def process_sequence(key):
+        dataset = InteractionSegmentData(process_range_list=[key],
+                                         data_prefix=run_cfg["data"]["data_prefix"],
+                                         enable_obj_model=False)
+        return dataset.get_cache()
+
+    # build_cache checks existing output BEFORE invoking process_sequence. No
+    # checkpoint/log rotation is needed for this independent CPU entry point.
+    manifest = build_cache(cache_path, process_range_list, split, process_sequence,
+                           resume=run_cfg["cache"]["resume"])
+    _logger.info("Cache ready: %s | %d segments", cache_path, manifest["segment_count"])
 
 
 if __name__ == "__main__":

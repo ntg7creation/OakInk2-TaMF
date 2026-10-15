@@ -1,0 +1,2 @@
+# Keep the portable Slurm wrappers executable by Bash in WSL/Linux checkouts.
+script/slurm/*.sbatch text eol=lf

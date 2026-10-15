@@ -14,8 +14,8 @@ import logging
 
 
 def setup_ddp(rank, world_size):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "12355")
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     assert rank == torch.distributed.get_rank(), "Something wrong with DDP setup"
     dist.barrier()

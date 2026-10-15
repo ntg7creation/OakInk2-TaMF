@@ -11,6 +11,8 @@ import shutil
 import tqdm
 import time
 import pickle
+import signal
+from pathlib import Path
 
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -35,6 +37,12 @@ from dev_fn.util import random_util
 from dev_fn.transform.cast import map_copy_select_to
 from ..dataset.interaction_segment import InteractionSegmentData
 from ..dataset.collate import interaction_segment_collate
+from ..dataset.training_data import build_datasets, build_loaders, evaluation_enabled, recording_due
+from ..dataset.cache_util import publish_new
+from ..util.training_state import (
+    make_signature, prepare_experiment, resolve_checkpoint, restore_checkpoint, validate_resume_destination,
+    save_distributed_checkpoint, select_cuda_devices, stop_at_boundary,
+)
 from ..model.interaction_segment_mdm import InterationSegmentMDM
 from ..model.interaction_segment_extra_loss import InteractionSegmentExtraLoss
 from ..model.diffusion_util import create_gaussian_diffusion
@@ -58,6 +66,13 @@ PARAM_PREFIX__RUNTIME = "runtime"
 
 
 def reg_entry(config_reg: ConfigRegistry):
+    config_reg.register("require_verified_cache", prefix=PARAM_PREFIX__TRAIN, category=bool,
+                        source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG,
+                        cmdpattern=ConfigEntryCommandlineBoolPattern.SET_TRUE, default=False)
+    config_reg.register("resume_checkpoint", prefix=PARAM_PREFIX__TRAIN, category=str,
+                        source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG, default=None)
+    config_reg.register("max_seconds", prefix=PARAM_PREFIX__RUNTIME, category=float,
+                        source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG, default=None)
     # base
     config_reg.register(
         "data_prefix",
@@ -305,13 +320,15 @@ def summary_extra_loss(summary_writer, loss_store, extra_loss_store, lr=None, st
         summary_writer.add_scalar(tag="lr", value=float(lr), global_step=step_id, walltime=time_curr)
 
 
-def run(rank, world_size, ckpt_cfg, run_cfg):
+def run(rank, world_size, ckpt_cfg, run_cfg, session_id, stop_event, deadline):
     log.log_init()
     log.enable_console()
     ddp_util.log_status_update(rank)  # disable root_logger on non_zero rank
 
-    ckpt.ckpt_setup(ckpt_cfg, rank=rank)
-    ckpt.ckpt_opt(ckpt_cfg, rank=rank, world_size=world_size, ckpt=ckpt_cfg, run=run_cfg)
+    session_path = Path(ckpt_cfg["ckpt_path"]) / "sessions" / session_id
+    session_cfg = dict(ckpt_cfg, ckpt_path=str(session_path), log_file=str(session_path / "log.txt"))
+    ckpt.ckpt_setup(session_cfg, rank=rank)
+    ckpt.ckpt_opt(session_cfg, rank=rank, world_size=world_size, ckpt=ckpt_cfg, run=run_cfg)
 
     _logger.info("world_size: %d", world_size)
     _logger.info("ckpt_cfg: %s", argdict_to_string(ckpt_cfg))
@@ -331,105 +348,21 @@ def run(rank, world_size, ckpt_cfg, run_cfg):
     commit = ckpt_cfg["commit"]
     ckpt_path = ckpt_cfg["ckpt_path"]
 
-    # dataset
-    train_process_range = run_cfg["train"]["process_range"]
-    if run_cfg["train"]["cache_dict_filepath"] is not None:
-        with open(run_cfg["train"]["cache_dict_filepath"], "rb") as ifstream:
-            train_dataset_cache_dict = pickle.load(ifstream)
-    else:
-        train_dataset_cache_dict = None
-    train_dataset = InteractionSegmentData(
-        process_range_list=train_process_range,
-        data_prefix=run_cfg["data"]["data_prefix"],
-        obj_embedding_prefix=run_cfg["data"]["obj_embedding_prefix"],
-        enable_obj_model=run_cfg["data"]["enable_obj_model"],
-        obj_pointcloud_prefix=run_cfg["data"]["obj_pointcloud_prefix"],
-        cache_dict=train_dataset_cache_dict,
-        append_reverse_segment=run_cfg["data"]["append_reverse_segment"],
-        rank=rank,
-    )
-    if not rank:
-        val_process_range = run_cfg["val"]["process_range"]
-        if run_cfg["val"]["cache_dict_filepath"] is not None:
-            with open(run_cfg["val"]["cache_dict_filepath"], "rb") as ifstream:
-                val_dataset_cache_dict = pickle.load(ifstream)
-        else:
-            val_dataset_cache_dict = None
-        val_dataset = InteractionSegmentData(
-            process_range_list=val_process_range,
-            data_prefix=run_cfg["data"]["data_prefix"],
-            obj_embedding_prefix=run_cfg["data"]["obj_embedding_prefix"],
-            enable_obj_model=run_cfg["data"]["enable_obj_model"],
-            obj_pointcloud_prefix=run_cfg["data"]["obj_pointcloud_prefix"],
-            cache_dict=val_dataset_cache_dict,
-            rank=rank,
-        )
-        test_process_range = run_cfg["test"]["process_range"]
-        if run_cfg["test"]["cache_dict_filepath"] is not None:
-            with open(run_cfg["test"]["cache_dict_filepath"], "rb") as ifstream:
-                test_dataset_cache_dict = pickle.load(ifstream)
-        else:
-            test_dataset_cache_dict = None
-        test_dataset = InteractionSegmentData(
-            process_range_list=test_process_range,
-            data_prefix=run_cfg["data"]["data_prefix"],
-            obj_embedding_prefix=run_cfg["data"]["obj_embedding_prefix"],
-            enable_obj_model=run_cfg["data"]["enable_obj_model"],
-            obj_pointcloud_prefix=run_cfg["data"]["obj_pointcloud_prefix"],
-            cache_dict=test_dataset_cache_dict,
-            rank=rank,
-        )
-    else:
-        val_process_range, val_dataset = None, None
-        test_process_range, test_dataset = None, None
-
-    # handle batch_size
-    world_batch_size = run_cfg["train"]["batch_size"]
-    if world_batch_size % world_size != 0:
-        _logger.warning("batch_size %d is not divisible by world_size %d", world_batch_size, world_size)
-    batch_size = world_batch_size // world_size
-    _logger.info("batch_size: %d | equiv world_batch_size %d", batch_size, batch_size * world_size)
-
-    # handle data_loader
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        collate_fn=interaction_segment_collate,
-        batch_size=batch_size,
-        num_workers=run_cfg["runtime"]["num_worker"],
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        drop_last=True,
-        pin_memory=True,
-        persistent_workers=True,
-        worker_init_fn=None,
-    )
-    if not rank:
-        val_dataloader = torch.utils.data.DataLoader(
-            val_dataset,
-            collate_fn=interaction_segment_collate,
-            batch_size=run_cfg["val"]["batch_size"],
-            num_workers=run_cfg["runtime"]["num_worker"],
-            shuffle=False,
-            drop_last=False,
-            pin_memory=True,
-            persistent_workers=True,
-            worker_init_fn=None,
-        )
-        test_dataloader = torch.utils.data.DataLoader(
-            test_dataset,
-            collate_fn=interaction_segment_collate,
-            batch_size=run_cfg["test"]["batch_size"],
-            num_workers=run_cfg["runtime"]["num_worker"],
-            shuffle=False,
-            drop_last=False,
-            pin_memory=True,
-            persistent_workers=True,
-            worker_init_fn=None,
-        )
-    else:
-        val_dataloader = None
-        test_dataloader = None
+    # Seed initialization as well as training; rank zero's weights are broadcast.
+    seed = run_cfg["runtime"]["seed"] + rank
+    random_util.setup_seed(seed)
+    datasets, cache_identities = build_datasets(run_cfg, rank)
+    loader_generator = torch.Generator().manual_seed(seed)
+    loaders, train_sampler = build_loaders(
+        datasets, run_cfg, rank, world_size, interaction_segment_collate, loader_generator)
+    train_dataloader, val_dataloader, test_dataloader = (loaders[k] for k in ("train", "val", "test"))
+    batch_size = run_cfg["train"]["batch_size"] // world_size
+    # Evaluation caches exist only on rank zero; every rank must compare the
+    # same complete data identity when resuming a distributed checkpoint.
+    identities = [cache_identities if rank == 0 else None]
+    dist.broadcast_object_list(identities, src=0)
+    cache_identities = identities[0]
+    signature = make_signature(run_cfg, cache_identities, world_size)
 
     # model
     model_cfg = run_cfg["model"]
@@ -488,12 +421,29 @@ def run(rank, world_size, ckpt_cfg, run_cfg):
         seed = seed + rank
     random_util.setup_seed(seed)
 
+    start_epoch, global_updates = 0, 0
+    resume = run_cfg["train"].get("resume_checkpoint")
+    if resume:
+        checkpoint_path = resolve_checkpoint(resume, ckpt_path)
+        start_epoch, global_updates = restore_checkpoint(
+            checkpoint_path, model_, optimizer, scheduler, signature, rank,
+            device=device, generator=loader_generator)
+        if global_updates != start_epoch * len(train_dataloader):
+            raise ValueError("checkpoint update count does not match completed epochs and loader size")
+        _logger.info("Resumed %s at epoch %d, updates %d", checkpoint_path, start_epoch, global_updates)
+    if start_epoch >= run_cfg["train"]["num_epoch"]:
+        raise ValueError("num_epoch is a total target and must exceed the checkpoint's completed epochs")
+
     # mainloop
     dist.barrier()
     num_epoch = run_cfg["train"]["num_epoch"]
-    for epoch_id in range(num_epoch):
+    for epoch_id in range(start_epoch, num_epoch):
+        epoch_start = time.monotonic()
         # epoch begin
         train_sampler.set_epoch(epoch_id)
+        # Dataset transforms are deterministic. Epoch-specific worker seeds also
+        # keep worker restart from consuming the model/noise RNG streams.
+        loader_generator.manual_seed(seed + 1000003 * epoch_id)
 
         # epoch iterate
         pbar = (
@@ -530,6 +480,7 @@ def run(rank, world_size, ckpt_cfg, run_cfg):
             clip_gradient(optimizer, 0.1, 2.0)
             optimizer.step()
             optimizer.zero_grad()
+            global_updates += 1
 
             # summary writer
             summary_extra_loss(
@@ -556,25 +507,6 @@ def run(rank, world_size, ckpt_cfg, run_cfg):
             _logger.info("                     %s: %f", loss_name.ljust(20), float(loss_node))
 
         if not rank:
-            # record_state
-            record_freq = run_cfg["train"]["record_freq"]
-            if (
-                commit
-                and (record_freq is not None and record_freq != -1)
-                and (epoch_id == 0 or epoch_id % record_freq == record_freq - 1 or epoch_id == num_epoch - 1)
-            ):
-                model_weight_path = ckpt.handle_save_path(
-                    f"?(ckpt_path)/save/model_{epoch_id:0>4}.pt", ckpt_path=ckpt_path
-                )
-                save_state(model.state_dict(), model_weight_path, remove_prefix="module", filter_out="clip_model")
-                optimizer_weight_path = ckpt.handle_save_path(
-                    f"?(ckpt_path)/save/optimizer_{epoch_id:0>4}.pt", ckpt_path=ckpt_path
-                )
-                save_state(optimizer.state_dict(), optimizer_weight_path)
-
-        dist.barrier()
-
-        if not rank:
             # val
             val_freq = run_cfg["val"]["val_freq"]
             if (val_freq is not None and val_freq != -1) and (
@@ -588,18 +520,18 @@ def run(rank, world_size, ckpt_cfg, run_cfg):
                         desc=f"val   epoch {epoch_id:>04d}:",
                     )
                     sample_fn = diffusion.p_sample_loop
-                    model.eval()
+                    model_.eval()
                     for val_batch_id, val_batch in enumerate(val_dataloader):
                         val_batch_device = map_copy_select_to(
                             val_batch,
                             device=device,
                             dtype=dtype,
-                            select=("mask", "pose_repr", "shape", "obj_num", "obj_embedding"),
+                            select=("mask", "pose_repr", "shape", "obj_num", "obj_traj", "obj_embedding"),
                         )
                         val_input_shape = tuple(val_batch_device["pose_repr"].shape)
                         val_input_shape = (val_input_shape[0], val_input_shape[2], 1, val_input_shape[1])
                         val_sample = sample_fn(
-                            model,
+                            model_,
                             val_input_shape,  # adapt from mdm
                             clip_denoised=False,
                             model_kwargs={"batch": val_batch_device},
@@ -628,18 +560,18 @@ def run(rank, world_size, ckpt_cfg, run_cfg):
                         desc=f"test  epoch {epoch_id:>04d}:",
                     )
                     sample_fn = diffusion.p_sample_loop
-                    model.eval()
+                    model_.eval()
                     for test_batch_id, test_batch in enumerate(test_dataloader):
                         test_batch_device = map_copy_select_to(
                             test_batch,
                             device=device,
                             dtype=dtype,
-                            select=("mask", "pose_repr", "shape", "obj_num", "obj_embedding"),
+                            select=("mask", "pose_repr", "shape", "obj_num", "obj_traj", "obj_embedding"),
                         )
                         test_input_shape = tuple(test_batch_device["pose_repr"].shape)  # (bs, seqlen, in_dim, 1)
                         test_input_shape = (test_input_shape[0], test_input_shape[2], 1, test_input_shape[1])
                         test_sample = sample_fn(
-                            model,
+                            model_,
                             test_input_shape,  # adapt from mdm
                             clip_denoised=False,
                             model_kwargs={"batch": test_batch_device},
@@ -655,7 +587,47 @@ def run(rank, world_size, ckpt_cfg, run_cfg):
                     test_pbar.close()
                     _logger.info("test epoch %04d conclude", epoch_id)
 
+        # All ranks finish evaluation before capturing the next epoch's RNG.
+        dist.barrier()
+        decision = [None]
+        if rank == 0:
+            elapsed = time.monotonic() - epoch_start
+            decision[0] = stop_at_boundary(stop_event.is_set(), deadline, elapsed)
+            _logger.info("epoch wall time %.1fs | stop at boundary=%s", elapsed, decision[0])
+        dist.broadcast_object_list(decision, src=0)
+        stopping = decision[0]
+        due = recording_due(epoch_id, num_epoch, run_cfg["train"]["record_freq"])
+        if commit and (due or stopping):
+            state_path = Path(ckpt_path) / "save" / f"state_epoch_{epoch_id:04d}_{session_id}.pt"
+            save_distributed_checkpoint(
+                state_path, model_, optimizer, scheduler, completed_epoch=epoch_id,
+                global_updates=global_updates, signature=signature, rank=rank,
+                world_size=world_size, device=device, generator=loader_generator)
+            # Retain original inference-compatible exports; never replace files.
+            result = [None]
+            if rank == 0:
+                try:
+                    weights = {k: v for k, v in model_.state_dict().items() if not k.startswith("clip_model")}
+                    for name, state in (("model", weights), ("optimizer", optimizer.state_dict())):
+                        output = Path(ckpt_path) / "save" / f"{name}_{epoch_id:04d}.pt"
+                        if output.exists():
+                            _logger.warning("Preserving existing legacy export %s", output)
+                        else:
+                            publish_new(output, lambda stream, value=state: torch.save(value, stream))
+                except Exception as exc:
+                    result[0] = f"{type(exc).__name__}: {exc}"
+            dist.broadcast_object_list(result, src=0)
+            if result[0]:
+                raise RuntimeError("legacy export failed (complete state already saved): " + result[0])
+            _logger.info("Complete epoch checkpoint: %s", state_path)
+        if stopping:
+            _logger.info("Clean epoch-boundary shutdown; partial epochs are never checkpointed")
+            break
+
     # conclude
+    if summary_writer.ddp_enabled:
+        summary_writer.flush()
+        summary_writer.close()
     ddp_util.destroy_ddp()
 
 
@@ -671,14 +643,38 @@ def main():
     ckpt_cfg = ckpt.reg_extract(config_reg)
     run_cfg = reg_extract(config_reg)
 
+    resume = run_cfg["train"]["resume_checkpoint"]
+    if resume and (run_cfg["train"]["reload_ckpt_model_filepath"] or
+                   run_cfg["train"]["reload_ckpt_optimizer_filepath"]):
+        raise ValueError("complete resume cannot be combined with legacy warm-start flags")
+    if resume and not run_cfg["train"]["cache_dict_filepath"]:
+        raise ValueError("complete resume requires a persistent training cache")
+    if resume:
+        run_cfg["train"]["resume_checkpoint"] = str(validate_resume_destination(resume, ckpt_cfg["ckpt_path"]))
+    evaluation_enabled(run_cfg["val"]["val_freq"])
+    evaluation_enabled(run_cfg["test"]["test_freq"])
+    evaluation_enabled(run_cfg["train"]["record_freq"])
+    max_seconds = run_cfg["runtime"]["max_seconds"]
+    if max_seconds is not None and (not np.isfinite(max_seconds) or max_seconds <= 600):
+        raise ValueError("runtime.max_seconds must exceed the 600-second shutdown reserve")
+    deadline = time.monotonic() + max_seconds if max_seconds is not None else None
+    session_id = prepare_experiment(ckpt_cfg["ckpt_path"], commit=ckpt_cfg["commit"], resume=resume)
+
     device_id_list = run_cfg["runtime"]["device_id"]
-    ddp_util.validate_device_id_list(device_id_list)
     world_size = len(device_id_list)
-    # replace underlying device
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(el) for el in device_id_list)
+    os.environ["CUDA_VISIBLE_DEVICES"] = select_cuda_devices(
+        device_id_list, torch.cuda.device_count(), os.environ.get("CUDA_VISIBLE_DEVICES"))
     run_cfg["runtime"]["device_id"] = list(range(world_size))
 
-    mp.spawn(run, args=(world_size, ckpt_cfg, run_cfg), nprocs=world_size)
+    stop_event = mp.get_context("spawn").Event()
+    previous_handler = None
+    if hasattr(signal, "SIGUSR1"):
+        previous_handler = signal.signal(signal.SIGUSR1, lambda signum, frame: stop_event.set())
+    try:
+        mp.spawn(run, args=(world_size, ckpt_cfg, run_cfg, session_id, stop_event, deadline), nprocs=world_size)
+    finally:
+        if previous_handler is not None:
+            signal.signal(signal.SIGUSR1, previous_handler)
 
 
 if __name__ == "__main__":
