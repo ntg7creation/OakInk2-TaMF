@@ -45,7 +45,8 @@ def make_signature(run_cfg, cache_identities, world_size):
     assets = {}
     for key in ("vpe_path", "c_weight_path"):
         if key in loss:
-            assets[key] = sha256_file(loss.pop(key))
+            assetPath = loss.pop(key)
+            assets[key] = sha256_file(assetPath) if assetPath else None
     mano = Path(run_cfg["mano"]["mano_path"])
     assets["clip_loader"] = sha256_source(root / "thirdparty/CLIP/clip/clip.py")
     assets["clip_tokenizer"] = sha256_source(root / "thirdparty/CLIP/clip/simple_tokenizer.py")
