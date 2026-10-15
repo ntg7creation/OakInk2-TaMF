@@ -1,0 +1,6 @@
+{
+  "motion_count": 91,
+  "mean_CET_degrees": 9.965959984933022,
+  "mean_absolute_activity_rate_gap_degrees_per_second": 1.9790365483315997,
+  "activity_gap_definition": "Equal-motion mean of absolute differences between prediction and GT whole-hand angular variation rate. Each whole-hand rate averages 15 joint rates. This is additional descriptive analysis, not CET."
+}

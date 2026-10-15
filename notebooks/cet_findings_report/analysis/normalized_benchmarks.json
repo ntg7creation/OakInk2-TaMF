@@ -1,0 +1,18 @@
+{
+  "motion_count": 91,
+  "PCET_percent": 30.021255929523093,
+  "NAE_rate_percent": 37.50328144714691,
+  "mean_CET_degrees": 9.965959984933022,
+  "mean_GT_absolute_flexion_degrees": 33.196345976759865,
+  "mean_absolute_activity_rate_error_degrees_per_second": 1.9790365483315997,
+  "mean_GT_activity_rate_degrees_per_second": 5.276969033018193,
+  "mean_of_individual_PCET_percent": 32.26139997591723,
+  "mean_of_individual_rate_error_percent": 31.43926548577871,
+  "PCET_excluding_552_percent": 29.40595758763186,
+  "NAE_excluding_552_percent": 32.61907732012305,
+  "definitions": {
+    "PCET": "100 * sum_i CET_i / sum_i GT_mean_absolute_flexion_i",
+    "NAE_rate": "100 * sum_i abs(predicted_activity_rate_i - GT_activity_rate_i) / sum_i GT_activity_rate_i"
+  },
+  "interpretation": "Proposed descriptive normalizations, not original CET. PCET compares angular magnitudes with differing temporal weightings, not fraction of movement lost. NAE zero means exact scalar activity rate matching for all motions, not trajectory matching. Positive batch reference denominators required."
+}

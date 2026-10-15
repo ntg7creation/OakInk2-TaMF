@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import logging
+import math
 
 import manotorch
 from manotorch.manolayer import ManoLayer
@@ -11,6 +12,7 @@ from dev_fn.transform.rotation_np import rot6d_to_rotmat_np
 from dev_fn.transform.rotation import rot6d_to_rotmat, rotmat_to_quat
 from pytorch3d.structures import Meshes
 from .loss.chamfer_distance import point2point_signed
+from .loss.cet import CETLoss
 
 _logger = logging.getLogger(__name__)
 
@@ -53,6 +55,16 @@ class InteractionSegmentExtraLoss(torch.nn.Module):
         self.coef_edge_len_loss = loss_cfg["coef_edge_len_loss"]
         self.coef_dist_h_loss = loss_cfg["coef_dist_h_loss"]
         self.coef_dist_o_loss = loss_cfg["coef_dist_o_loss"]
+
+        self.cet_weight = float(loss_cfg.get("cet_weight", 0.0))
+        if not math.isfinite(self.cet_weight) or self.cet_weight < 0:
+            raise ValueError("cet_weight must be finite and nonnegative")
+        self.cet_loss = None
+        if self.cet_weight > 0:
+            self.cet_loss = CETLoss(
+                mano_path, rho=loss_cfg.get("cet_dtw_rho", 0.10),
+                profile=loss_cfg.get("cet_profile", False),
+            )
 
     def retrieve_hand_faces(self, hand_side):
         if hand_side == "rh":
@@ -194,4 +206,16 @@ class InteractionSegmentExtraLoss(torch.nn.Module):
             "dist_h": loss_dist_h,
             "dist_o": loss_dist_o,
         }
+        if self.cet_loss is not None:
+            cet, diagnostics = self.cet_loss(
+                model_output.squeeze(2).transpose(1, 2), batch["pose_repr"],
+                batch["mask"], batch["hand_side"], batch["frame_id"],
+            )
+            weighted_cet = self.cet_weight * cet
+            loss = loss + weighted_cet
+            loss_dict.update(cet=cet, cet_weighted=weighted_cet, **diagnostics)
+            loss_dict["loss"] = loss
+        else:
+            # Do not decode, align, or add even a zero term to the legacy graph.
+            loss_dict.update(cet=0.0, cet_weighted=0.0)
         return loss, loss_dict

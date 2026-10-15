@@ -1,0 +1,8 @@
+{
+  "mean_CET_degrees": 9.965959984933022,
+  "mean_GT_absolute_flexion_degrees": 33.196345976759865,
+  "ratio_of_batch_means_percent": 30.021255929523093,
+  "median_per_motion_output_GT_activity_percent": 75.80658322868618,
+  "median_activity_shortfall_percent": 24.19341677131382,
+  "note": "CET/depth compares angular magnitudes with DTW-path versus original-frame weighting. It is not fraction of movement lost. Activity uses median of per-motion prediction/GT total angular variation ratios."
+}

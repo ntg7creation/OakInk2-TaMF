@@ -1,0 +1,7 @@
+# Smoke-test coefficient only; the research-run coefficient is still undecided.
+# Overlay after config/loss_param.yml. Omit this file for the original objective.
+train:
+  loss:
+    cet_weight: 0.1
+    cet_dtw_rho: 0.10
+    cet_profile: true

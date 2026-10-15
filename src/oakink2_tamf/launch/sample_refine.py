@@ -116,6 +116,14 @@ def reg_entry(config_reg: ConfigRegistry):
         category=str,
         source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG,
     )
+    config_reg.register(
+        "pose_repr_sample_dir",
+        prefix=PARAM_PREFIX__DEBUG,
+        category=str,
+        source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG,
+        callback=abspath_callback,
+        default="common/sample/main/sample/test/arch_mdm_l__0399",
+    )
 
 
 def reg_extract(config_reg: ConfigRegistry):
@@ -168,10 +176,10 @@ def main():
     all_object_store = all_dataset.obj_store
     pose_repr_sample_dataset = GeneratedPoseReprSampleAdaptor(
         all_dataset,
-        ["common/sample/main/sample/test/arch_mdm_l__0399"],
+        [run_cfg["debug"]["pose_repr_sample_dir"]],
     )
 
-    device = torch.device(f"cuda:{4}")
+    device = torch.device("cuda:0")
     dtype = torch.float32
     mano_layer_rh = ManoLayer(
         mano_assets_root=run_cfg["mano"]["mano_path"],

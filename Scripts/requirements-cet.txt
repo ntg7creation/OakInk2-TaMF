@@ -1,0 +1,3 @@
+# Extra dependency of vendored manotorch.axislayer (existing TaMF env supplies
+# NumPy, PyTorch, packaging, MANO/chumpy and the project packages).
+deprecation==2.1.0

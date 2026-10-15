@@ -1,0 +1,10 @@
+{
+  "verified_motions": 91,
+  "csv_json_CET_match": true,
+  "all_CET_finger_joint_values_reconstructed": true,
+  "all_GT_and_prediction_descriptors_reconstructed": true,
+  "source_results_unchanged": true,
+  "current_evaluator_matches_saved_hash": true,
+  "report_pages": 13,
+  "slides": 11
+}

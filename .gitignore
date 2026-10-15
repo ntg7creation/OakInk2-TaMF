@@ -146,3 +146,36 @@ manual/viz/c3d_data
 
 # thirdparty/blender
 # /thirdparty/bpy/*.whl
+
+
+
+# ==========================================
+# Research notebook generated outputs
+# ==========================================
+
+/notebooks/exports/
+
+# Temporary report exports
+/notebooks/cet_findings_report/analysis/export_contact_*.jpg
+/notebooks/cet_findings_report/analysis/notebook_source.txt
+/notebooks/cet_findings_report/analysis/report_text.txt
+/notebooks/cet_findings_report/analysis/source_document.txt
+
+# ==========================================
+# Local configuration and credentials
+# ==========================================
+
+.env
+.env.*
+!.env.example
+!.env.template
+
+/.aws/
+/.ssh/
+
+# ==========================================
+# Slurm server logs
+# ==========================================
+
+slurm-*.out
+slurm-*.err

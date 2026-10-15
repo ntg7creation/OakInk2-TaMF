@@ -17,6 +17,20 @@ def reg_loss_param(config_reg: ConfigRegistry, param_prefix: Optional[str] = Non
         ws_dir = ""
 
     config_reg.register(
+        "cet_weight", prefix=param_prefix, category=float,
+        source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG, default=0.0,
+    )
+    config_reg.register(
+        "cet_dtw_rho", prefix=param_prefix, category=float,
+        source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG, default=0.10,
+    )
+    config_reg.register(
+        "cet_profile", prefix=param_prefix, category=bool,
+        source=ConfigEntrySource.COMMANDLINE_OVER_CONFIG,
+        cmdpattern=ConfigEntryCommandlineBoolPattern.SET_TRUE, default=False,
+    )
+
+    config_reg.register(
         "vpe_path",
         prefix=param_prefix,
         category=str,

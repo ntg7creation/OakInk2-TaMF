@@ -242,7 +242,7 @@ def main():
     #     ["common/sample/main/sample/test/arch_mdm_l__0399"],
     # )
 
-    device = torch.device(f"cuda:{4}")
+    device = torch.device("cuda:0")
     dtype = torch.float32
 
     model_cfg = run_cfg["model"]
