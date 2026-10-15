@@ -1,0 +1,7 @@
+# Candidate coefficient, to be checked by a bounded server diagnostic first.
+# Overlay AFTER config/shenkar_generator_full.yml; original losses stay enabled.
+train:
+  loss:
+    cet_weight: 0.05
+    cet_dtw_rho: 0.1
+    cet_profile: false

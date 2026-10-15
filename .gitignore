@@ -179,3 +179,7 @@ manual/viz/c3d_data
 
 slurm-*.out
 slurm-*.err
+
+# Future server smoke logs; keep smoke_test split lists and source fixtures.
+/smoke_test/logs/
+/smoke_test/**/events.out.tfevents.*

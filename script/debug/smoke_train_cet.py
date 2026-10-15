@@ -19,7 +19,33 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 from oakink2_tamf.model.loss.cet import normalized_time
+
+
+def cet_generator_gradient_norm(cet, model):
+    """Isolated CET gradient; retain graph for the ordinary total backward pass."""
+    if not cet.requires_grad:
+        raise RuntimeError("CET is detached from the generator")
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    gradients = torch.autograd.grad(cet, parameters, retain_graph=True, allow_unused=True)
+    squared = 0.0
+    for gradient in gradients:
+        if gradient is not None:
+            if not torch.isfinite(gradient).all():
+                raise RuntimeError("nonfinite CET-only generator gradients")
+            squared += float(gradient.detach().double().square().sum())
+    norm = math.sqrt(squared)
+    if norm == 0:
+        raise RuntimeError("CET contributes zero generator gradient on the diagnostic batch")
+    return norm
+
+
+def cpu_peak_rss_bytes():
+    # Linux ru_maxrss is KiB; includes the full cache-loading peak. This is CPU
+    # process high-water memory, not CET-only live RAM, and does not reset per arm.
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
 
 
 def validate_batch_contract(batch):
@@ -91,6 +117,7 @@ def run(args):
     from oakink2_tamf.model.diffusion_util import create_gaussian_diffusion
     from oakink2_tamf.util.net_util import clip_gradient
     from torch.utils.tensorboard import SummaryWriter
+    from script.slurm.cet_jobs import code_identity
 
     device = torch.device(args.device)
     batch = load_batch(args)
@@ -122,6 +149,8 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=True)
     report = {"seed": args.seed, "samples": metadata, "cache": str(args.cache.resolve()),
               "sample_indices": args.sample_indices, "device": str(device), "model_config": model_cfg,
+              "loss_config": loss_cfg, "code_identity": code_identity(), "data_root": str(args.data_prefix.resolve()),
+              "cache_stat": {"size": args.cache.stat().st_size, "mtime_ns": args.cache.stat().st_mtime_ns},
               "scope": "single-GPU resident-batch optimizer steps; excludes loading/logging; no checkpoints or sampling",
               "profile_cet": args.profile_cet, "warmup_steps_per_arm": args.warmup_steps,
               "measured_steps_per_arm": args.steps, "arms": {}}
@@ -134,10 +163,15 @@ def run(args):
         model.train()
         torch.cuda.reset_peak_memory_stats(device)
         rows = []
+        cet_grad_norm = None
         with SummaryWriter(str(args.output / name)) as writer:
             for step in range(args.warmup_steps + args.steps):
                 optimizer.zero_grad()
                 torch.cuda.synchronize(device)
+                if step == args.warmup_steps:
+                    # Exclude the isolated CET-gradient probe and startup work
+                    # from both measured timing AND peak allocated GPU memory.
+                    torch.cuda.reset_peak_memory_stats(device)
                 begin = time.perf_counter()
                 timestep = (0, 500, 999)[step % 3]
                 t = torch.full((x_start.shape[0],), timestep, device=device, dtype=torch.long)
@@ -147,6 +181,10 @@ def run(args):
                 total = diffusion_loss + aux
                 if not torch.isfinite(total):
                     raise RuntimeError(f"{name} step {step}: nonfinite total loss")
+                if name == "cet" and args.check_cet_grad and step == 0:
+                    # First WARMUP only: exclude the extra backward calculation
+                    # from measured step timing and do not alter optimizer grads.
+                    cet_grad_norm = cet_generator_gradient_norm(detail["cet"], model)
                 total.backward()
                 finite = [torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None]
                 if not finite or not torch.stack(finite).all():
@@ -158,6 +196,9 @@ def run(args):
                 row = {"step": step, "timestep": timestep, "seconds": seconds,
                        "diffusion_loss": float(diffusion_loss.detach()), "total_loss": float(total.detach()),
                        **{k: float(v.detach()) if torch.is_tensor(v) else float(v) for k, v in detail.items()}}
+                original = row["total_loss"] - row["cet_weighted"]
+                row["original_total_loss"] = original
+                row["cet_fraction_of_original"] = row["cet_weighted"] / max(abs(original), 1e-12)
                 for key, value in row.items():
                     writer.add_scalar(key, value, step)
                 if step >= args.warmup_steps:
@@ -168,14 +209,18 @@ def run(args):
         if not changed:
             raise RuntimeError(f"{name}: generator weights did not update")
         report["arms"][name] = {"cet_weight": coefficient, "weights_updated": changed, "steps": rows,
+                                "cet_generator_grad_norm": cet_grad_norm,
                                 "median_step_seconds": statistics.median(r["seconds"] for r in rows),
-                                "peak_cuda_bytes": torch.cuda.max_memory_allocated(device)}
+                                "peak_cuda_bytes": torch.cuda.max_memory_allocated(device),
+                                "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
+                                "process_peak_rss_bytes": cpu_peak_rss_bytes()}
         del extra, optimizer
     baseline = report["arms"]["baseline"]["median_step_seconds"]
     enabled = report["arms"]["cet"]["median_step_seconds"]
     report["median_overhead_seconds"] = enabled - baseline
     report["median_overhead_percent"] = 100 * (enabled / baseline - 1)
-    report["timing_caveat"] = "Three-step smoke timing is noisy; profiling synchronization and finite-gradient checks add overhead."
+    report["timing_caveat"] = ("Resident-batch timing excludes data loading; profiling and finite-gradient checks add overhead. "
+                               "CPU peak RSS is cumulative across arms, including cache loading. Confirm a full epoch separately.")
     (args.output / "results.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(json.dumps(report, indent=2))
 
@@ -197,12 +242,15 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--profile-cet", action="store_true", help="synchronized CET forward and CPU-DTW timings")
+    parser.add_argument("--check-cet-grad", action="store_true", help="measure CET-only generator gradient during first warmup")
     parser.add_argument("--check-inputs-only", action="store_true", help="verify cached batch; no model or optimizer steps")
     parser.add_argument("--output", type=Path, help="new or empty experiment directory, required for optimizer steps")
     args = parser.parse_args()
     if not 1 <= args.steps <= 10 or not 0 <= args.warmup_steps <= 2 or not 1 <= len(args.sample_indices) <= 4:
         parser.error("bounded smoke test: 1–10 measured steps, 0–2 warmups, 1–4 samples")
     if not args.check_inputs_only:
+        if args.check_cet_grad and args.warmup_steps < 1:
+            parser.error("--check-cet-grad requires a warmup to keep gradient diagnostics out of measured timing")
         if torch.device(args.device).type != "cuda" or not torch.cuda.is_available():
             parser.error("optimizer smoke test requires CUDA; use --check-inputs-only for input inspection")
         if args.output is None or (args.output.exists() and (not args.output.is_dir() or any(args.output.iterdir()))):

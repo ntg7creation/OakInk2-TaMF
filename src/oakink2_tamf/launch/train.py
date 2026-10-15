@@ -307,6 +307,10 @@ def reg_extract(config_reg: ConfigRegistry):
 def summary_extra_loss(summary_writer, loss_store, extra_loss_store, lr=None, step_id=None):
     time_curr = time.time()
     summary_writer.add_scalar(
+        tag="total_loss", value=float(loss_store["diffusion_loss"]) + float(extra_loss_store["loss"]),
+        global_step=step_id, walltime=time_curr,
+    )
+    summary_writer.add_scalar(
         tag="diffusion_loss", value=float(loss_store["diffusion_loss"]), global_step=step_id, walltime=time_curr
     )
     for loss_name, loss_node in extra_loss_store.items():
@@ -498,6 +502,7 @@ def run(rank, world_size, ckpt_cfg, run_cfg, session_id, stop_event, deadline):
         scheduler.step()
         dist.barrier()
         _logger.info("train epoch %04d conclude | loss: %f", epoch_id, loss.item())
+        summary_writer.add_scalar(tag="epoch", value=epoch_id, global_step=step_id)
         _logger.info("train epoch %04d lr %s", epoch_id, [group["lr"] for group in optimizer.param_groups])
         _logger.info("train epoch %04d detail loss:", epoch_id)
         _logger.info("                     %s: %f", "diffusion_loss".ljust(20), float(loss_store["diffusion_loss"]))
