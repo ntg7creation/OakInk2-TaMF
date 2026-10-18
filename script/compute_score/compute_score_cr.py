@@ -33,6 +33,7 @@ import manotorch
 from manotorch.manolayer import ManoLayer
 
 from tqdm import tqdm
+from oakink2_tamf.util.evaluation_output import MetricOutput, register_evaluation_output
 
 _logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ PARAM_PREFIX__RUNTIME = "runtime"
 
 
 def reg_entry(config_reg: ConfigRegistry):
+    register_evaluation_output(config_reg)
     # override default
     # config_reg.meta_info["exp_id"].default = "main"
 
@@ -158,6 +160,7 @@ def main():
     config_reg.parse(parser)
 
     run_cfg = reg_extract(config_reg)
+    recorder = MetricOutput(run_cfg["debug"].get("evaluation_output_dir"))
 
     log.log_init()
     log.enable_console()
@@ -184,7 +187,7 @@ def main():
     #     ["common/sample/main/sample/test/arch_mdm_l__0399"],
     # )
 
-    device = torch.device("cuda:0")
+    device = torch.device(run_cfg["debug"]["evaluation_device"])
     dtype = torch.float32
     mano_layer_rh = ManoLayer(
         mano_assets_root=run_cfg["mano"]["mano_path"],
@@ -229,6 +232,7 @@ def main():
             continue
         with open(load_filepath, "rb") as ifstream:
             refined_sample = pickle.load(ifstream)
+        recorder.add(sample_id, gt_sample)
         refined_hand_verts = refined_sample["verts"]
 
         text = gt_sample["text"]
@@ -287,6 +291,7 @@ def main():
     os.makedirs("./tmp/compute_score/contact_ratio/", exist_ok=True)
     np.save("./tmp/compute_score/contact_ratio/gt_contact_dist.npy", gt_contact_dist)
     np.save("./tmp/compute_score/contact_ratio/refined_contact_dist.npy", refined_contact_dist)
+    recorder.frames(gt_contact_dist, refined_contact_dist, contact=True)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ import manotorch
 from manotorch.manolayer import ManoLayer
 
 from tqdm import tqdm
+from oakink2_tamf.util.evaluation_output import MetricOutput, register_evaluation_output
 
 _logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ PARAM_PREFIX__RUNTIME = "runtime"
 
 
 def reg_entry(config_reg: ConfigRegistry):
+    register_evaluation_output(config_reg)
     # override default
     # config_reg.meta_info["exp_id"].default = "main"
 
@@ -160,6 +162,7 @@ def main():
     config_reg.parse(parser)
 
     run_cfg = reg_extract(config_reg)
+    recorder = MetricOutput(run_cfg["debug"].get("evaluation_output_dir"))
 
     log.log_init()
     log.enable_console()
@@ -186,7 +189,7 @@ def main():
     #     ["common/sample/main/sample/test/arch_mdm_l__0399"],
     # )
 
-    device = torch.device("cuda:0")
+    device = torch.device(run_cfg["debug"]["evaluation_device"])
     dtype = torch.float32
     mano_layer_rh = ManoLayer(
         mano_assets_root=run_cfg["mano"]["mano_path"],
@@ -231,6 +234,7 @@ def main():
             continue
         with open(load_filepath, "rb") as ifstream:
             refined_sample = pickle.load(ifstream)
+        recorder.add(sample_id, gt_sample)
         refined_hand_joints = refined_sample["joints"]
 
         text = gt_sample["text"]
@@ -315,6 +319,10 @@ def main():
     pskl_1 = 1 / num_feat * np.sum(dataset_mean_ps * np.log(dataset_mean_ps / model_mean_ps))
     pskl_2 = 1 / num_feat * np.sum(model_mean_ps * np.log(model_mean_ps / dataset_mean_ps))
     print(pskl_1, pskl_2)
+    recorder.save(dict(gt_to_prediction=float(pskl_1), prediction_to_gt=float(pskl_2),
+                       aggregation="population joint acceleration spectra; no per-motion PSKL-J"),
+                  dict(gt_power=dataset_psd, prediction_power=model_psd,
+                       gt_distribution=dataset_mean_ps, prediction_distribution=model_mean_ps))
 
 
 if __name__ == "__main__":

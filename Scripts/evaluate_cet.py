@@ -252,7 +252,7 @@ def relative_input(root, value):
     return (Path(root) / value).resolve()
 
 
-def inspect_batch(manifest_path, cache_path, generated_root, refined_root, root=ROOT):
+def inspect_batch(manifest_path, cache_path, generated_root, refined_root, root=ROOT, require_refined=True):
     """Read-only inventory and pairing validation, no angle extraction or metric."""
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     require(sha256(cache_path) == manifest["subset_cache_sha256"], "prepared cache checksum mismatch")
@@ -302,19 +302,21 @@ def inspect_batch(manifest_path, cache_path, generated_root, refined_root, root=
             "found_G": gp.is_file(), "found_R": rp.is_file(), "status": "paired", "reason": "",
         }
         try:
-            if not gp.is_file() or not rp.is_file():
+            if not gp.is_file() or (require_refined and not rp.is_file()):
                 entry["status"] = "missing"
-                raise InvalidInput("missing " + "/".join(x for x, p in (("G", gp), ("R", rp)) if not p.is_file()))
+                required = (("G", gp), ("R", rp)) if require_refined else (("G", gp),)
+                raise InvalidInput("missing " + "/".join(x for x, p in required if not p.is_file()))
             require(sha256(gp) == s["sha256"], "representative G checksum mismatch")
             gt = valid_prefix(cache[PREFIX + "pose_list"][subset_index], int(n), (16, 3, 3), "GT pose")
             check_rotations(gt)
             decode_pose(np.load(gp, allow_pickle=False), int(n))
-            r = read_pickle(rp)
-            require(tuple(r["info"]) == info and r["hand_side"] == info[2], "R motion key/side mismatch")
-            require(r["len"] == n and np.array_equal(r["frame_id"], frames), "R valid length/frame IDs mismatch")
-            decode_pose(r["refine_pose_repr"], int(n))
             entry["G_sha256"] = s["sha256"]
-            entry["R_sha256"] = sha256(rp)
+            if require_refined:
+                r = read_pickle(rp)
+                require(tuple(r["info"]) == info and r["hand_side"] == info[2], "R motion key/side mismatch")
+                require(r["len"] == n and np.array_equal(r["frame_id"], frames), "R valid length/frame IDs mismatch")
+                decode_pose(r["refine_pose_repr"], int(n))
+                entry["R_sha256"] = sha256(rp)
         except (InvalidInput, ValueError, OSError, KeyError, TypeError, EOFError, pickle.UnpicklingError) as exc:
             if entry["status"] != "missing":
                 entry["status"] = "invalid"
@@ -400,14 +402,19 @@ def flatten_row(row, stage):
 def run(args):
     out = args.output_dir.resolve()
     require(not out.exists() or not any(out.iterdir()), "output directory must be new or empty")
-    cache, entries, inventory = inspect_batch(args.manifest, args.cache, args.generated_root, args.refined_root)
+    stages = ("R", "G") if args.stage == "both" else (args.stage,)
+    # Historical standalone CLI still requires both stages unless explicitly
+    # requested; the general saved-motion entry point uses stage-only pairing.
+    require_both = not getattr(args, "stage_only_pairing", False)
+    cache, entries, inventory = inspect_batch(args.manifest, args.cache, args.generated_root,
+                                             args.refined_root, require_refined=require_both or "R" in stages)
     timing = timing_provenance()
     frame_id_fps = timing["frame_id_clock_hz"]
     out.mkdir(parents=True, exist_ok=True)
     provenance = {
         "implementation_version": VERSION, "script_sha256": sha256(__file__),
         "command": sys.argv, "created_utc": datetime.now(timezone.utc).isoformat(),
-        "scope": "available partial batch only; not full-test-set evaluation",
+        "scope": getattr(args, "scope", "available partial batch only; not full-test-set evaluation"),
         "aggregation": "each successful unique motion has equal weight; population standard deviation",
         "angle_source": "parent-relative MANO rotations in fixed manotorch anatomical template axes",
         "angle_convention": CONVENTION, "joint_names": JOINT_NAMES, "finger_names": FINGERS,
@@ -419,8 +426,9 @@ def run(args):
         "filtering_policy": "none", "timing_provenance": timing,
         "duration_normalized_variation": "TV / ((last frame ID - first frame ID) / FPS_MOCAP); omitted for singletons",
         "descriptor_aggregation": "calculate each joint statistic over valid frames, then mean 3 joints per finger or 15 per hand",
-        "pairing_policy": "manifest original IDs + subset positions + info keys; first cache occurrence; require valid G and R for either stage",
-        "pairing_limitation": "preparation hashes pin cache after preparation; generation-time cache checksum was not recorded",
+        "pairing_policy": "manifest original IDs + subset positions + info keys; first cache occurrence; "
+                          + ("require valid G and R for either stage" if require_both else "validate requested prediction stage"),
+        "pairing_limitation": "preparation hashes pin current inputs; generation-time identity requires a contemporaneous manifest",
         "input_paths": {k: str(getattr(args, k).resolve()) for k in
                         ("manifest", "cache", "generated_root", "refined_root", "mano_root")},
         "input_sha256": {"manifest": sha256(args.manifest), "cache": sha256(args.cache)},
@@ -436,7 +444,6 @@ def run(args):
         return 0
     bases, axis_provenance = load_anatomical_bases(args.mano_root)
     provenance["anatomical_template_provenance"] = axis_provenance
-    stages = ("R", "G") if args.stage == "both" else (args.stage,)
     selected = [e for e in entries if args.motion_index is None or e["original_motion_index"] == args.motion_index]
     require(bool(selected), "requested original representative motion index was not found")
     provenance["selection"] = {"original_motion_index": args.motion_index,
@@ -453,11 +460,13 @@ def run(args):
                 frames = np.asarray(cache[PREFIX + "frame_id_list"][i], dtype=np.int64)
                 u = normalized_time(frames)
                 gt = curl_from_local_rotations(valid_prefix(cache[PREFIX + "pose_list"][i], n, (16, 3, 3), "GT"), bases[side])
-                r = read_pickle(e["R_source"])
-                predictions = {
-                    "R": curl_from_local_rotations(decode_pose(r["refine_pose_repr"], n), bases[side]),
-                    "G": curl_from_local_rotations(decode_pose(np.load(e["G_source"], allow_pickle=False), n), bases[side]),
-                }
+                predictions = {}
+                if require_both or "R" in stages:
+                    r = read_pickle(e["R_source"])
+                    predictions["R"] = curl_from_local_rotations(decode_pose(r["refine_pose_repr"], n), bases[side])
+                if require_both or "G" in stages:
+                    predictions["G"] = curl_from_local_rotations(
+                        decode_pose(np.load(e["G_source"], allow_pickle=False), n), bases[side])
                 # Check all angle definitions for either stage so G and R cannot
                 # quietly use different successful motion sets.
                 for stage in stages:
@@ -522,6 +531,8 @@ def main():
     p.add_argument("--refined-root", type=Path, default=ROOT / "common/sample_refine/partial_test_one/sample/test_one/arch_mdm_l__0399")
     p.add_argument("--mano-root", type=Path, default=ROOT / "asset/mano_v1_2")
     p.add_argument("--stage", choices=("R", "G", "both"), default="R")
+    p.add_argument("--stage-only-pairing", action="store_true",
+                   help="validate only the requested prediction stage; permits G-only evaluation without R")
     p.add_argument("--rho", type=float, default=0.10)
     p.add_argument("--motion-index", type=int, help="evaluate only this ORIGINAL first-occurrence cache ID")
     p.add_argument("--inventory-only", action="store_true", help="validate pairing only; no MANO or CET")

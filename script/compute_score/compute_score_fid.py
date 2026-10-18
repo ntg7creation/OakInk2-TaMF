@@ -37,6 +37,7 @@ import manotorch
 from manotorch.manolayer import ManoLayer
 
 from tqdm import tqdm
+from oakink2_tamf.util.evaluation_output import MetricOutput, register_evaluation_output
 
 _logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ PARAM_PREFIX__RUNTIME = "runtime"
 
 
 def reg_entry(config_reg: ConfigRegistry):
+    register_evaluation_output(config_reg)
     # override default
     # config_reg.meta_info["exp_id"].default = "main"
 
@@ -215,6 +217,11 @@ def main():
     config_reg.parse(parser)
 
     run_cfg = reg_extract(config_reg)
+    recorder = MetricOutput(run_cfg["debug"].get("evaluation_output_dir"))
+    seed = run_cfg["debug"].get("evaluation_seed")
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
     log.log_init()
     log.enable_console()
@@ -242,7 +249,7 @@ def main():
     #     ["common/sample/main/sample/test/arch_mdm_l__0399"],
     # )
 
-    device = torch.device("cuda:0")
+    device = torch.device(run_cfg["debug"]["evaluation_device"])
     dtype = torch.float32
 
     model_cfg = run_cfg["model"]
@@ -289,6 +296,7 @@ def main():
             continue
         with open(load_filepath, "rb") as ifstream:
             _refined_sample = pickle.load(ifstream)
+        recorder.add(sample_id, gt_sample)
 
         text = gt_sample["text"]
         avai_len = gt_sample["len"]
@@ -359,6 +367,12 @@ def main():
     print(dataset_statistics[0].shape, dataset_statistics[1].shape)
     fid_value = calculate_fid(dataset_statistics, model_statistics)
     print(fid_value)
+    recorder.save(dict(fid=float(fid_value), seed=seed,
+                       encoder_training_mode=segment_encoder.training,
+                       aggregation="population encoder features; no per-motion FID"),
+                  dict(gt_features=dataset_activation, prediction_features=model_activation,
+                       gt_mean=dataset_statistics[0], gt_covariance=dataset_statistics[1],
+                       prediction_mean=model_statistics[0], prediction_covariance=model_statistics[1]))
 
 
 if __name__ == "__main__":

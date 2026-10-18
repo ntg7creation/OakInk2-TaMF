@@ -36,6 +36,7 @@ import manotorch
 from manotorch.manolayer import ManoLayer
 
 from tqdm import tqdm
+from oakink2_tamf.util.evaluation_output import MetricOutput, register_evaluation_output
 
 _logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ obj_sdf_map = {}
 
 
 def reg_entry(config_reg: ConfigRegistry):
+    register_evaluation_output(config_reg)
     # override default
     # config_reg.meta_info["exp_id"].default = "main"
 
@@ -164,6 +166,7 @@ def main():
     config_reg.parse(parser)
 
     run_cfg = reg_extract(config_reg)
+    recorder = MetricOutput(run_cfg["debug"].get("evaluation_output_dir"))
 
     log.log_init()
     log.enable_console()
@@ -190,7 +193,7 @@ def main():
     #     ["common/sample/main/sample/test/arch_mdm_l__0399"],
     # )
 
-    device = torch.device("cuda:0")
+    device = torch.device(run_cfg["debug"]["evaluation_device"])
     dtype = torch.float32
     mano_layer_rh = ManoLayer(
         mano_assets_root=run_cfg["mano"]["mano_path"],
@@ -235,6 +238,7 @@ def main():
             continue
         with open(load_filepath, "rb") as ifstream:
             refined_sample = pickle.load(ifstream)
+        recorder.add(sample_id, gt_sample)
         refined_hand_verts = refined_sample["verts"]
 
         text = gt_sample["text"]
@@ -304,6 +308,7 @@ def main():
     os.makedirs("./tmp/compute_score/solid_intersection_volume/", exist_ok=True)
     np.save("./tmp/compute_score/solid_intersection_volume/gt.npy", gt_siv_list)
     np.save("./tmp/compute_score/solid_intersection_volume/refined.npy", refined_siv_list)
+    recorder.frames(gt_siv_list, refined_siv_list)
 
 
 if __name__ == "__main__":

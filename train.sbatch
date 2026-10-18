@@ -18,9 +18,13 @@ DATA_ROOT=${DATA_ROOT:-"$(dirname -- "$REPO_ROOT")/OakInk2-data"}
 TRAIN_CACHE=${TRAIN_CACHE:-"$REPO_ROOT/common/preprocessed_cache_v1/train.pkl"}
 CONDA_BASE=${CONDA_BASE:-/opt/sw/miniforge3}
 TAMF_PYTHON=${TAMF_PYTHON:-python}
-[[ "$EXPERIMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo "Invalid experiment ID" >&2; exit 2; }
+[[ "$EXPERIMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo "Invalid experiment ID: '$EXPERIMENT_ID'" >&2; exit 2; }
 [[ "$TARGET_EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "TARGET_EPOCHS must be positive" >&2; exit 2; }
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || { echo "Repository directory unavailable: $REPO_ROOT" >&2; exit 1; }
+experiment_dir="$REPO_ROOT/common/train/$EXPERIMENT_ID"
+[[ -d "$experiment_dir" ]] || { echo "Experiment '$EXPERIMENT_ID' does not exist: $experiment_dir. Check EXPERIMENT_ID; continuation cannot create an experiment." >&2; exit 1; }
+[[ -f "$TRAIN_CACHE" ]] || { echo "Existing training cache missing: $TRAIN_CACHE. Restore the existing cache; continuation never rebuilds it." >&2; exit 1; }
+[[ -f "$TRAIN_CACHE.manifest.json" ]] || { echo "Training cache manifest missing: $TRAIN_CACHE.manifest.json. Restore the matching manifest for the existing cache." >&2; exit 1; }
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate "${TAMF_CONDA_ENV:-oakink2-tamf}"
 export PYTHONUNBUFFERED=1
@@ -28,7 +32,6 @@ export OMP_NUM_THREADS=1
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=$((15000 + ${SLURM_JOB_ID:-0} % 40000))
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-[[ -f "$TRAIN_CACHE" ]] || { echo "Existing cache missing: $TRAIN_CACHE" >&2; exit 1; }
 
 # Protect the experiment even if this script is submitted outside the launcher.
 mkdir -p "common/cet_jobs/$EXPERIMENT_ID"
@@ -37,19 +40,25 @@ flock -n 9 || { echo "Another continuation is training this experiment" >&2; exi
 
 # Command substitution preserves selection failures as a nonzero batch exit.
 # Resolve at RUN TIME, after the predecessor has saved its newest checkpoint.
-selection=$("$TAMF_PYTHON" - "common/train/$EXPERIMENT_ID" <<'PY'
+selection=$("$TAMF_PYTHON" - "$experiment_dir" <<'PY'
 import json
 import sys
 from pathlib import Path
 from oakink2_tamf.dataset.cache_util import manifest_path
 from oakink2_tamf.util.training_state import resolve_checkpoint
 
-checkpoint = resolve_checkpoint("latest", Path(sys.argv[1])).resolve()
-# resolve_checkpoint already verified this immutable file's size and checksum.
-metadata = json.loads(manifest_path(checkpoint).read_text(encoding="utf-8"))
-epoch = metadata["completed_epoch"]
-if not isinstance(epoch, int) or epoch < 0:
-    raise ValueError("Invalid completed epoch in checkpoint manifest")
+experiment = Path(sys.argv[1])
+try:
+    checkpoint = resolve_checkpoint("latest", experiment).resolve()
+    # resolve_checkpoint already verified this immutable file's size and checksum.
+    metadata = json.loads(manifest_path(checkpoint).read_text(encoding="utf-8"))
+    epoch = metadata["completed_epoch"]
+    if not isinstance(epoch, int) or epoch < 0:
+        raise ValueError("Invalid completed epoch in checkpoint manifest")
+except (OSError, ValueError, KeyError) as exc:
+    sys.exit(f"Cannot continue experiment '{experiment.name}': no usable verified training-state "
+             f"checkpoint in {experiment / 'save'}: {exc}. Expected state_epoch_*.pt with matching "
+             ".manifest.json; check EXPERIMENT_ID or submit_train_chain.sh --experiment ID.")
 print(checkpoint)
 print(epoch + 1)
 PY

@@ -245,6 +245,59 @@ new UUID experiment/control directories. It never performs raw preprocessing or
 motion sampling. Extra `--cfg` overlays can supply portable asset paths. This
 real-generator smoke is implemented but has **not** been run for this change.
 
+## Shenkar continuation chain
+
+The root `submit_train_chain.sh` defaults explicitly to `tamf_cet_001_retry1`.
+An exported `EXPERIMENT_ID` cannot change that choice; a conflicting value
+produces a warning. To intentionally select another **existing** experiment,
+pass `--experiment ID`. Existing session-count, `--after JOB_ID`, `--dry-run`,
+`TARGET_EPOCHS`, repository/cache/environment overrides and Slurm dependencies
+remain supported. Scripts that previously selected an experiment by exporting
+`EXPERIMENT_ID` must switch to `--experiment ID`.
+
+Before any scheduler calls, even for a dry run, the launcher requires the
+experiment directory, a complete `state_epoch_*.pt` checkpoint verified by the
+existing size/checksum/manifest verifier, the existing training cache, and its
+`.manifest.json` sidecar. It prints the selected experiment, verified checkpoint,
+cache/repository paths, total epoch target and session count. Run preflight in
+the training Conda environment, or set `TAMF_PYTHON` to its Python executable.
+Preflight only reads checkpoints and cache files; it never rebuilds the cache
+or creates/overwrites an experiment. Cache checks require the two files to
+exist; normal training retains its existing cache validation.
+
+The reported checkpoint is a preflight snapshot. `train.sbatch` independently
+selects the latest verified checkpoint when **each job starts**, after its
+predecessor finishes. The launcher does not pin the chain to the preflight
+checkpoint. A job that has already reached `TARGET_EPOCHS` exits successfully
+without training. The epoch target is a total, not a count of additional epochs.
+
+Future submission commands, after the local changes have been reviewed and
+deployed to Shenkar:
+
+```bash
+cd /home/ela.nitai/Desktop/GPU_access_folder/OakInk2-TaMF
+conda activate /home/ela.nitai/.conda/envs/oakink2-tamf
+export TAMF_CONDA_ENV=/home/ela.nitai/.conda/envs/oakink2-tamf
+export TARGET_EPOCHS=30
+bash submit_train_chain.sh 5 --dry-run
+bash submit_train_chain.sh 5
+
+# Intentional alternative: replace other_existing_experiment with a real ID.
+bash submit_train_chain.sh 2 --experiment other_existing_experiment --dry-run
+```
+
+Submission still automatically follows the last queued job with the same
+experiment job name. Use `--after JOB_ID` to specify a numeric predecessor
+explicitly. These changes require no cancellation or restart of the already
+submitted jobs 1233–1237; deployment remains separate from this local patch.
+
+Local regression tests use temporary CPU checkpoints and fake Slurm/Conda/
+training commands, with no server access or real submissions:
+
+```bash
+python -m unittest discover -s tests -p test_simple_slurm_chain.py -v
+```
+
 ## Slurm templates — provisional until server validation
 
 `script/slurm/preprocess.sbatch` and `script/slurm/train_cached.sbatch` take paths
